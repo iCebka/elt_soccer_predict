@@ -1,0 +1,83 @@
+services:
+  
+  kestra-db:
+    image: postgres:17-alpine
+    volumes:
+      - kestra-db-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_DB=${K_POSTGRES_DB}
+      - POSTGRES_USER=${K_POSTGRES_USER}
+      - POSTGRES_PASSWORD=${K_POSTGRES_PASSWORD}
+
+  
+  kestra:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lab-integrador-kestra:1.3.37
+    user: "root"
+    command: ["server", "standalone"]
+    ports:
+      - 8080:8080
+    environment:
+      ENV_SNOWFLAKE_ACCOUNT: ${SNOWFLAKE_ACCOUNT}
+      ENV_SNOWFLAKE_USER: ${SNOWFLAKE_USER}
+      ENV_SNOWFLAKE_PASSWORD: ${SNOWFLAKE_PASSWORD}
+      ENV_SNOWFLAKE_ROLE: ${SNOWFLAKE_ROLE}
+
+      ENV_SNOWFLAKE_WAREHOUSE: ${SNOWFLAKE_WAREHOUSE}
+      ENV_SNOWFLAKE_DATABASE: ${SNOWFLAKE_DATABASE}
+
+      ENV_SNOWFLAKE_RAW_SCHEMA: ${SNOWFLAKE_RAW_SCHEMA}
+      ENV_SNOWFLAKE_BRONZE_SCHEMA: ${SNOWFLAKE_BRONZE_SCHEMA}
+      ENV_SNOWFLAKE_SILVER_SCHEMA: ${SNOWFLAKE_SILVER_SCHEMA}
+      ENV_SNOWFLAKE_GOLD_SCHEMA: ${SNOWFLAKE_GOLD_SCHEMA}
+
+      DBT_RAW_SCHEMA: ${SNOWFLAKE_RAW_SCHEMA}
+      DBT_BRONZE_SCHEMA: ${SNOWFLAKE_BRONZE_SCHEMA}
+      DBT_SILVER_SCHEMA: ${SNOWFLAKE_SILVER_SCHEMA}
+      DBT_GOLD_SCHEMA: ${SNOWFLAKE_GOLD_SCHEMA}
+
+      KESTRA_CONFIGURATION: &common_conf |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://kestra-db:5432/${K_POSTGRES_DB}
+            driver-class-name: org.postgresql.Driver
+            username: ${K_POSTGRES_USER}
+            password: ${K_POSTGRES_PASSWORD}
+        kestra:
+          server:
+            basic-auth:
+              username: ${K_USER}
+              password: ${K_PASSWORD}
+          repository:
+            type: postgres
+          queue:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: /app/storage
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd-tmp
+          url: http://localhost:8080
+
+        micronaut:
+          io:
+            watch:
+              enabled: true
+              paths:
+                - /app/flows
+    
+    volumes:
+      - kestra-storage:/app/storage
+      - ./kestra/flows:/app/flows
+      - ./:/workspace/project:ro
+    depends_on:
+      - kestra-db
+
+
+volumes:
+  kestra-db-data:
+  kestra-storage:
