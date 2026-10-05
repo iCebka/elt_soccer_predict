@@ -1,5 +1,16 @@
 id: elt_football_it1
 namespace: company.team
+concurrency:
+  limit: 1
+  behavior: QUEUE
+
+triggers:
+  - id: source_refresh
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 8 * * 3,6"
+    timezone: America/Guayaquil
+    allowConcurrent: false
+    recoverMissedSchedules: LAST
 
 inputs:
   - id: assets
@@ -484,6 +495,13 @@ tasks:
       - id: extract
         type: io.kestra.plugin.core.http.Download
         uri: "https://pub-e682421888d945d684bcae8890b0ec20.r2.dev/data/{{ taskrun.value }}.csv.gz"
+        retry:
+          type: exponential
+          interval: PT30S
+          maxInterval: PT2M
+          maxAttempts: 3
+          maxDuration: PT5M
+          warningOnRetry: true
 
       - id: upload_to_stage
         type: io.kestra.plugin.jdbc.snowflake.Upload
@@ -499,6 +517,14 @@ tasks:
         fileName: "{{ taskrun.value }}.csv.gz"
         prefix: "{{ execution.id }}/"
         compress: false
+        retry:
+          type: exponential
+          interval: PT30S
+          maxInterval: PT2M
+          maxAttempts: 3
+          maxDuration: PT5M
+          warningOnRetry: true
+        
 
       - id: prepare_load_table
         type: io.kestra.plugin.jdbc.snowflake.Query
@@ -581,3 +607,117 @@ tasks:
       - id: delete_download
         type: io.kestra.plugin.core.storage.Delete
         uri: "{{ outputs.extract[taskrun.value].uri }}"
+
+  # ---------------------------------------------------------------------------
+  # Silver transformations and tests
+  # ---------------------------------------------------------------------------
+
+  - id: dbt_build_silver
+    type: io.kestra.plugin.dbt.cli.DbtCLI
+
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+
+    profiles: |
+      football:
+        target: prod
+        outputs:
+          prod:
+            type: snowflake
+            account: "{{ envs.snowflake_account }}"
+            user: "{{ envs.snowflake_user }}"
+            password: "{{ envs.snowflake_password }}"
+            role: "{{ envs.snowflake_role }}"
+            warehouse: "{{ envs.snowflake_warehouse }}"
+            database: "{{ envs.snowflake_database }}"
+            schema: "{{ envs.snowflake_silver_schema }}"
+            threads: 8
+
+    commands:
+      - >-
+        dbt build
+        --project-dir /workspace/project/dbt
+        --select path:models/silver
+        --exclude path:tests/gold
+        --target-path /tmp/dbt-target-{{ execution.id }}
+        --log-path /tmp/dbt-logs-{{ execution.id }}
+
+  # --------
+  # Gold
+  # --------
+
+  - id: dbt_build_gold
+    type: io.kestra.plugin.dbt.cli.DbtCLI
+
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+
+    profiles: |
+      football:
+        target: prod
+        outputs:
+          prod:
+            type: snowflake
+            account: "{{ envs.snowflake_account }}"
+            user: "{{ envs.snowflake_user }}"
+            password: "{{ envs.snowflake_password }}"
+            role: "{{ envs.snowflake_role }}"
+            warehouse: "{{ envs.snowflake_warehouse }}"
+            database: "{{ envs.snowflake_database }}"
+            schema: "{{ envs.snowflake_gold_schema }}"
+            threads: 8
+
+    commands:
+      - >-
+        dbt build
+        --project-dir /workspace/project/dbt
+        --select path:models/gold path:tests/gold
+        --target-path /tmp/dbt-gold-target-{{ execution.id }}
+        --log-path /tmp/dbt-gold-logs-{{ execution.id }}
+
+  # ---------------------------------------------------------------------------
+  # OBT with Spark
+  # ---------------------------------------------------------------------------
+
+  - id: spark_build_obt
+    type: io.kestra.plugin.scripts.shell.Commands
+
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+
+    commands:
+      - |
+        set -eu
+
+        export JAVA_HOME=/opt/java17
+
+        SPARK_MASTER="${SPARK_MASTER:-local[4]}"
+        SPARK_DRIVER_MEMORY="${SPARK_DRIVER_MEMORY:-2g}"
+
+        echo "[KESTRA] Building GOLD.OBT_FOOTBALL_EVENTS with Spark"
+        echo "[KESTRA] Spark master: ${SPARK_MASTER}"
+        echo "[KESTRA] Spark driver memory: ${SPARK_DRIVER_MEMORY}"
+
+        spark-submit \
+          --master "${SPARK_MASTER}" \
+          --driver-memory "${SPARK_DRIVER_MEMORY}" \
+          --packages "net.snowflake:spark-snowflake_2.12:3.2.2-spark_3.5,net.snowflake:snowflake-jdbc:4.0.2" \
+          --conf spark.jars.ivy=/tmp/.ivy2 \
+          --conf 'spark.driver.extraJavaOptions=-Daws.java.v1.disableDeprecationAnnouncement=true' \
+          --conf 'spark.executor.extraJavaOptions=-Daws.java.v1.disableDeprecationAnnouncement=true' \
+          --conf spark.default.parallelism=4 \
+          --conf spark.sql.shuffle.partitions=8 \
+          /workspace/project/spark/obt_football_events.py \
+          2>&1
+
+errors:
+  - id: log_flow_failure
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: |
+      Football ELT pipeline failed.
+      Flow: {{ flow.namespace }}.{{ flow.id }}
+      Execution: {{ execution.id }}
+      Failed tasks: {{ tasksWithState('FAILED') }}
+      Error logs:
+      {{ errorLogs() }}
